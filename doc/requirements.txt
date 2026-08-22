@@ -1,0 +1,21 @@
+# 向量模型本地运行
+sentence-transformers>=2.7.0
+torch>=2.0.0
+numpy>=1.24.0
+
+# BM25关键词检索
+rank-bm25>=0.2.2
+
+# 重排cross‑encoder（同样来自sentence‑transformers包，不需要额外装）
+
+# 大模型请求
+requests>=2.31.0
+
+# 阿里云 DashScope 向量模型 SDK
+dashscope>=1.20.0
+
+# 环境变量管理
+python-dotenv>=1.0.0
+
+# 单元测试
+pytest>=7.4.0
