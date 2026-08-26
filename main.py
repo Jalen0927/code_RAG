@@ -41,10 +41,13 @@ from config import EMBEDDING_DIMENSIONS
 # 一、索引初始化（程序启动时一次性完成）
 # ============================================================
 
-def build_index():
+def build_index(source_dir: str = "source_code"):
     """
     一次性完成全部索引初始化：读源码 → 切片 → 向量化 → 建向量库 → 建 BM25 索引
     → 初始化多路召回 → 初始化重排器 → 初始化 LLM 客户端。
+
+    参数:
+        source_dir: 源码根目录，默认 "source_code"。可动态切换到任意本地路径。
 
     返回:
         dict: 包含所有已初始化组件的字典，供后续查询使用。
@@ -56,12 +59,14 @@ def build_index():
     print("╚══════════════════════════════════════════════════════════╝")
     print()
 
+    print(f"📁 源码目录: {source_dir}")
+
     # ------------------------------------------------------------
     # 1. 读取源码文件
     # ------------------------------------------------------------
     print("📂 [1/8] 扫描源码文件中...")
     try:
-        docs = load_source_files("source_code")
+        docs = load_source_files(source_dir)
         print(f"       ✅ 已读取 {len(docs)} 个源码文件")
         if not docs:
             print("       ⚠️  没有读到任何源码文件，流程终止")
@@ -228,17 +233,17 @@ def answer_query(query: str, components: dict) -> bool:
         print(f"       扩充后候选池: {len(candidates)} 条")
 
         # ------------------------------------------------------------
-        # 步骤 3：Cross-Encoder 重排，取 Top 3
+        # 步骤 3：Cross-Encoder 重排，取 Top 8
         # ------------------------------------------------------------
         print("  🔹 [3/4] Cross-Encoder 精细重排中...")
-        top_n = reranker.rerank(query, candidates, top_n=3)
+        top_n = reranker.rerank(query, candidates, top_n=8)
         if not top_n:
             print("\n  🤔 重排后没有有效结果。")
             return True
 
-        # 后处理：保证 Top N 中至少有一个"含关键术语的源文件分片"
+        # 后处理：保证 Top N 中至少有 2 个"含关键术语的源文件分片"
         # 解决 rerank 模型偏向测试文件 docstring 的问题
-        top_n = multi.ensure_source_file_in_top_n(candidates, top_n, query)
+        top_n = multi.ensure_source_file_in_top_n(candidates, top_n, query, quota=2)
 
         # 打印重排结果（带重排分数）
         print(f"       🎯 精选 Top {len(top_n)} 最相关片段:")

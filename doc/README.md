@@ -2,6 +2,8 @@
 
 一个面向私有代码库的 RAG（Retrieval-Augmented Generation，检索增强生成）问答系统。把一份 Python 源码工程喂给它，它就能听懂你的中文问题，自动从代码里捞出最相关的几段，交给大模型读完后用人话回答你，并附上代码出处。
 
+**现已支持基于 Streamlit 的 Web 界面**，提供 VS Code Dark+ 风格的深色主题、分层树形源码浏览器、语法高亮、行号跳转以及问答结果一键联动源码查看等功能。
+
 适合场景：接手陌生代码库快速上手、跨文件追查某功能实现、不想一个个翻文件找答案。
 
 ---
@@ -17,6 +19,12 @@
 - **混合重排分**：最终分 = 0.6×重排分 + 0.4×融合分，既听模型精排，又保留关键词/源文件启发式话语权。
 - **零向量数据库依赖**：向量库用 NumPy 手搓内存版，BM25 用 rank_bm25，无需部署 Milvus/FAISS/ES。
 - **断点率可视化调试**：`chunk_viewer.py` 单文件查看切片质量，输出断点率和分片预览。
+- **Streamlit Web 界面**：
+  - **VS Code Dark+ 深色主题**：精心调配的 Trae 风格配色，代码块使用 Pygments 语法高亮（VS Code 配色方案）。
+  - **源码浏览器**：分层树形文件树（每层缩进 + 左边框层级感），支持 Python 语法高亮、行号跳转、完整视图/附近视图切换。
+  - **问答 ↔ 源码联动**：问答结果中的代码片段可一键跳转到源码浏览器对应文件与行号。
+  - **代码库管理**：支持输入本地路径或上传 ZIP 压缩包动态切换源码目录，无需重启。
+  - **React Bug 修复**：采用两阶段渲染机制（进度条 → 结果展示），彻底避免 Streamlit 中的 `removeChild` DOM 错误。
 
 ---
 
@@ -24,29 +32,44 @@
 
 ```
 code_RAG/
-├── main.py                    # 程序入口 + 交互主循环
-├── config.py                  # 读取 .env，统一配置项
-├── embedding_client.py        # 阿里云 DashScope 向量模型客户端
-├── llm_client.py              # 小米 MiMo 大模型客户端
-├── chunk_viewer.py            # 切片质量调试工具
-├── .env.example               # 环境变量示例
-├── ingestion/                 # 数据入库层
-│   ├── file_loader.py         # 源码文件加载器（扫描 .py）
-│   └── code_splitter.py       # 代码感知切片器
-├── retriever/                 # 检索层
-│   ├── vector_store.py        # 内存向量库（NumPy 手搓）
-│   ├── bm25_retriever.py      # BM25 关键词检索
-│   ├── multi_retriever.py     # 多路召回融合 + 后处理启发式（核心）
-│   └── reranker.py            # Cross-Encoder 重排器
-├── source_code/               # 被索引的源码工程（file_agent 项目）
+├── app.py                    # Streamlit Web UI 主程序
+├── main.py                   # 程序入口 + 命令行交互主循环
+├── config.py                 # 读取 .env，统一配置项
+├── embedding_client.py       # 阿里云 DashScope 向量模型客户端
+├── llm_client.py             # 小米 MiMo 大模型客户端
+├── chunk_viewer.py           # 切片质量调试工具
+├── .env.example              # 环境变量示例
+├── requirements.txt          # 依赖清单
+├── .streamlit/               # Streamlit 配置目录
+│   └── config.toml           # Web 界面全局主题与服务器配置
+├── ingestion/                # 数据入库层
+│   ├── file_loader.py        # 源码文件加载器（扫描 .py）
+│   └── code_splitter.py      # 代码感知切片器
+├── retriever/                # 检索层
+│   ├── vector_store.py       # 内存向量库（NumPy 手搓）
+│   ├── bm25_retriever.py     # BM25 关键词检索
+│   ├── multi_retriever.py    # 多路召回融合 + 后处理启发式（核心）
+│   └── reranker.py           # Cross-Encoder 重排器
+├── test/                     # 单元测试（核心模块均覆盖）
+│   ├── test_code_splitter.py
+│   ├── test_multi_retriever.py
+│   ├── test_reranker.py
+│   ├── test_bm25_retriever.py
+│   ├── test_vector_store.py
+│   └── ...
+├── source_code/              # 被索引的源码工程
 │   └── file_agent/
 │       ├── react_scheduler.py
 │       ├── registry.py
 │       ├── file_tools.py
 │       └── ...
 ├── doc/
-│   └── test_record.md         # 已知短板记录
-└── workspace/                 # 运行时安全工作目录
+│   ├── README.md             # 本说明文档
+│   ├── test_record.md        # 已知短板记录
+│   ├── bug_fix.md            # Bug 修复记录
+│   ├── interview_case_study.md # 面试案例研究
+│   └── leetcode_plan.md      # LeetCode 刷题计划
+└── workspace/                # 运行时安全工作目录
 ```
 
 ---
@@ -55,6 +78,7 @@ code_RAG/
 
 - **Python** 3.10+
 - **核心库**：
+  - `streamlit` — Web UI 框架（新增）
   - `requests` — 调大模型 HTTP 接口
   - `python-dotenv` — 加载 `.env` 配置
   - `numpy` — 向量库矩阵运算
@@ -69,12 +93,42 @@ code_RAG/
 安装依赖：
 
 ```bash
-pip install requests python-dotenv numpy rank_bm25 dashscope sentence-transformers
+pip install streamlit requests python-dotenv numpy rank_bm25 dashscope sentence-transformers
 ```
 
 ---
 
 ## 四、启动运行步骤
+
+### 方式 A：Streamlit Web 界面（推荐）
+
+1. **进入项目目录并启动**
+
+   ```bash
+   cd code_RAG
+   python -m streamlit run app.py
+   ```
+
+2. **浏览器访问**
+
+   启动后终端会显示类似 `Local URL: http://localhost:8501`，在浏览器中打开即可。
+
+3. **界面功能导航**
+
+   Web 界面包含两个主要标签页：
+
+   - **💬 智能问答**：
+     - 点击预设的一键示例问题，或在输入框中键入你的问题，点击「🚀 开始提问」。
+     - 系统将展示进度条，依次显示向量化、多路召回、精排、大模型生成等阶段。
+     - 回答生成后，下方会列出 Top 代码片段，每个片段提供「📂 在源码浏览器打开」按钮，点击可跳转到源码浏览器查看完整上下文。
+
+   - **📂 源码浏览器**：
+     - 左侧为分层树形文件目录结构，点击文件夹图标可展开/折叠，点击 `.py` 文件图标可在右侧查看源码。
+     - 右侧代码区支持语法高亮、行号显示。
+     - 顶部「跳转到行号」输入框可快速定位到指定行附近（显示目标行前后 30 行，共约 60 行），也可切换到「完整视图」查看整个文件。
+     - 侧边栏「📁 代码库管理」支持动态输入本地路径或上传 ZIP 压缩包重建索引。
+
+### 方式 B：命令行交互（CLI）
 
 1. **克隆/进入项目目录**
 
@@ -144,7 +198,25 @@ pip install requests python-dotenv numpy rank_bm25 dashscope sentence-transforme
 
 ---
 
-## 六、项目亮点
+## 六、Streamlit 主题配置
+
+`.streamlit/config.toml` 已预配置 VS Code Dark+ 风格的深色主题：
+
+```toml
+[theme]
+base = "dark"
+primaryColor = "#0e639c"        # 选中蓝
+backgroundColor = "#1e1e1e"      # 编辑器深色底
+secondaryBackgroundColor = "#252526"  # 侧边栏/面板深灰
+textColor = "#cccccc"            # 文字浅灰
+font = "sans serif"
+```
+
+如需调整颜色方案，可修改此文件中的颜色值，或在 `app.py` 的 `_inject_theme_css()` 函数中自定义 CSS。
+
+---
+
+## 七、项目亮点
 
 1. **代码结构感知的切片器**：不是按字符数硬切，而是先用 `_parse_line_blocks` 识别 `def`/`class` 边界，过长类按方法切，过长函数兜底滑动窗口 + 括号深度感知（`_find_safe_split_pos`），保证长列表 `TOOL_DEFINITIONS=[...]` 在元素边界切分而非字典中间。实测 `registry.py` / `react_scheduler.py` 断点率从 50% 降到 0%。
 
@@ -158,9 +230,11 @@ pip install requests python-dotenv numpy rank_bm25 dashscope sentence-transforme
 
 6. **可观测的调试工具链**：`chunk_viewer.py` 查切片质量，`multi_retriever` 每步打印加权日志，`expand_with_neighbors` 打印邻域扩充新增条数和文件分布，方便定位"为什么没召回"。
 
+7. **专业级 Web 界面**：基于 Streamlit 构建，实现了 VS Code Dark+ 风格主题、分层树形源码浏览、Pygments 语法高亮、问答源码联动跳转等特性。采用两阶段渲染机制解决了 Streamlit 中常见的 React DOM `removeChild` 错误。
+
 ---
 
-## 七、当前已知局限
+## 八、当前已知局限
 
 1. **点名提问仍可能漏召回目标分片**：当其他文件的 Cross-Encoder 重排分显著更高时，即使开了源文件名额预留，也无法把目标文件内语义得分劣势的分片送入 Top N。后处理加权只能做偏好引导，不能强行逆转重排模型的相关性判断。
    - 典型案例：问 `registry.py` 注册机制、问 `file_tools.py` 全部工具函数，目标文件后半段核心分片仍可能漏召。
@@ -174,7 +248,7 @@ pip install requests python-dotenv numpy rank_bm25 dashscope sentence-transforme
 
 ---
 
-## 八、后续可优化方向
+## 九、后续可优化方向
 
 1. **切片器类型识别细化**：当前 chunk_type 把模块级大字典（如 `TOOL_DEFINITIONS=[...]`）标为 `other`，导致注册机制核心代码不被加权。可新增 `module_data` 类型单独加分，从源头解决而非靠后处理兜底。
 
@@ -188,12 +262,20 @@ pip install requests python-dotenv numpy rank_bm25 dashscope sentence-transforme
 
 6. **残缺分片检测**：切片后加一道校验，若分片开头是缩进的字符串/标量值且上一分片末尾非 `,\n`，回退重切，进一步压低断点率。
 
+7. **Web 界面增强**：
+   - 增加代码 diff 对比视图
+   - 支持多文件并行问答
+   - 记录历史对话，支持会话恢复
+
 ---
 
-## 九、技术栈速览
+## 十、技术栈速览
 
 | 模块 | 技术选型 |
 |---|---|
+| Web 框架 | Streamlit（新增） |
+| 主题方案 | VS Code Dark+ 风格（自定义 CSS） |
+| 语法高亮 | Pygments（通过 Streamlit 内置代码块） |
 | 向量模型 | 阿里云 DashScope `qwen3.7-text-embedding`（1024 维） |
 | 关键词检索 | `rank_bm25.BM25Okapi`（中文 2-gram 滑窗分词） |
 | 向量库 | NumPy 手搓内存版（余弦相似度） |

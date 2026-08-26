@@ -77,6 +77,52 @@ class MultiRetriever:
     # 同文件加权增量（邻域扩充后，对和源分片同文件的候选加轻微偏好）
     # 注意：数值不能过大，防止强行把无关分片顶到前排引入噪声
     SAME_FILE_BONUS = 0.04
+
+    # 业务关键词路由映射：把用户查询中的业务关键词 → 对应源文件
+    # 作用：当用户问的是"工具"时，直接给 registry.py / file_tools.py 的分片加一个小 boost，
+    #       避免被 main.py / config.py 里的"工具"关键词高频噪声抢占前排。
+    # 设计原则：
+    #   - 只做"轻推"（boost 0.15），不做"硬路由"，不压制 Cross-Encoder 的语义判断
+    #   - 只对源文件加分，测试文件不加
+    #   - 关键词用小写做精确子串匹配，覆盖中英文表达差异
+    BUSINESS_KEYWORD_ROUTE = {
+        # 工具注册 / 文件操作
+        "tool": ["registry.py", "file_tools.py"],
+        "工具": ["registry.py", "file_tools.py"],
+        "注册": ["registry.py"],
+        "registry": ["registry.py"],
+        "file": ["file_tools.py"],
+        "文件": ["file_tools.py"],
+        "加载": ["file_tools.py"],
+        "load": ["file_tools.py"],
+        # 调度 / 执行流程
+        "scheduler": ["react_scheduler.py"],
+        "调度": ["react_scheduler.py"],
+        "react": ["react_scheduler.py"],
+        "loop": ["react_scheduler.py"],
+        # 大模型调用
+        "llm": ["llm_client.py"],
+        "大模型": ["llm_client.py"],
+        "模型": ["llm_client.py"],
+        "prompt": ["llm_client.py"],
+        # 状态管理
+        "state": ["state.py"],
+        "状态": ["state.py"],
+        # 沙箱 / 安全
+        "sandbox": ["sandbox.py"],
+        "沙箱": ["sandbox.py"],
+        # 配置
+        "config": ["config.py"],
+        "配置": ["config.py"],
+        # 入口 / 主逻辑
+        "main": ["main.py"],
+        "入口": ["main.py"],
+        "agent": ["main.py", "react_scheduler.py"],
+    }
+
+    # 业务路由 boost 系数：小值即可（加法，不是乘法），
+    # 足够把目标文件分片推到候选中前排，但不压制 rerank 语义判断
+    BUSINESS_ROUTE_BOOST = 0.15
     # ———————————————————————
 
     def __init__(self, vector_store: InMemoryVectorStore,
@@ -295,6 +341,47 @@ class MultiRetriever:
         if in_test_dir or is_test_file:
             return 0.0
         return 1.0
+
+    @staticmethod
+    def _compute_business_route_boost(query: str, file_path: str) -> float:
+        """
+        业务关键词路由：根据用户查询中的业务关键词，给对应源文件加一个小 boost。
+
+        原理：
+          用户问"工具"时，registry.py 和 file_tools.py 应该比 main.py 更相关。
+          但向量/BM25 检索可能让 main.py 的"工具"关键词分片得分更高（因为它是入口）。
+          这里用关键词→文件映射做一个"轻推"：给命中业务关键词的源文件分片加 0.15 分。
+
+          这不是"硬路由"——最终排序还是靠 Cross-Encoder 语义判断，
+          这里只是确保目标文件的分片不会在召回阶段就被噪声淹没。
+
+        参数:
+            query:      用户原始查询
+            file_path:  分片所属文件路径
+
+        返回:
+            float: 0.0（不命中）或 BUSINESS_ROUTE_BOOST（命中）
+        """
+        import os
+        # 只给源文件加分，测试文件不加
+        source_boost = MultiRetriever._compute_source_boost(file_path)
+        if source_boost <= 0:
+            return 0.0
+
+        file_name = os.path.basename(file_path).lower()
+        query_lower = query.lower()
+
+        boost = 0.0
+        for keyword, target_files in MultiRetriever.BUSINESS_KEYWORD_ROUTE.items():
+            # 查询包含关键词（子串匹配，覆盖中英文混合表达）
+            if keyword.lower() not in query_lower:
+                continue
+            # 当前文件在关键词路由的目标列表里
+            if any(file_name == tf.lower() for tf in target_files):
+                boost += MultiRetriever.BUSINESS_ROUTE_BOOST
+
+        # 上限封顶：一个分片同时命中多个关键词时最多加 0.3
+        return min(boost, 0.3)
 
     @staticmethod
     def _classify_chunk_type(chunk_text: str) -> str:
@@ -540,6 +627,12 @@ class MultiRetriever:
                 src_multiplier = 1.0 - self.TEST_PENALTY_MULTIPLIER
             final_score = base_score * kw_multiplier * src_multiplier
 
+            # 4e: 业务关键词路由加分（加法，轻推不硬路由）
+            route_boost = self._compute_business_route_boost(
+                query_text, it["file_path"]
+            )
+            final_score += route_boost
+
             it["vector_score_norm"] = vec_norm
             it["bm25_score_norm"] = bm25_norm
             it["keyword_boost"] = kw_boost
@@ -547,6 +640,7 @@ class MultiRetriever:
             it["kw_multiplier"] = kw_multiplier
             it["src_multiplier"] = src_multiplier
             it["base_score"] = base_score
+            it["route_boost"] = route_boost
             it["score"] = final_score
 
         # ---------- 第 4.5 步：chunk_type 元标签后处理加权 ----------
@@ -709,15 +803,16 @@ class MultiRetriever:
 
     def ensure_source_file_in_top_n(self, candidates: list[dict],
                                     top_n: list[dict],
-                                    query: str) -> list[dict]:
+                                    query: str,
+                                    quota: int = 2) -> list[dict]:
         """
-        后处理：保证 rerank Top N 中至少包含一个"含关键术语的源文件分片"。
+        后处理：保证 rerank Top N 中至少包含 quota 个"含关键术语的源文件分片"。
 
         为什么需要这一步？
           rerank 模型（cross-encoder/ms-marco-MiniLM-L-6-v2）是 6 层小模型，
           对"中文自然语言问题 vs Python 代码"的语义匹配能力有限，常常把
           测试文件的 docstring 误判为比源码本身更相关。本方法在 rerank 完成
-          后做一次"兜底提升"，保证至少有一个"含查询关键术语的源文件分片"
+          后做一次"兜底提升"，保证至少有 quota 个"含查询关键术语的源文件分片"
           进入最终给 LLM 的 Top N。
 
         判断标准（同时满足才算"相关的源文件分片"）：
@@ -727,94 +822,107 @@ class MultiRetriever:
 
         策略：
           1. 文件名匹配优先：若用户问题里的英文词出现在某源文件名里，
-             且 Top N 里没有该文件，直接拎一个该文件分片替换最后一名
+             且 Top N 里没有该文件，直接拎 quota 个该文件分片替换最后 quota 名
              （不看 chunk_type，因为注册机制核心可能写在模块级变量里）
-          2. 业务实现兜底：若 Top N 里没有"含关键术语的源文件业务实现分片"，
-             从 candidates 里按分降序找第一个替换最后一名
-          3. 如果已有，不干预 rerank 判断
+          2. 业务实现兜底：若 Top N 里"含关键术语的源文件分片"数量不足 quota，
+             从 candidates 里按分降序找对应的源文件分片补齐
+          3. 如果已有 quota 个以上，不干预 rerank 判断
 
         参数:
             candidates: multi.search 返回的完整候选列表（按 score 降序）
             top_n:      reranker.rerank 返回的精排结果（按 rerank_score 降序）
             query:      用户原始查询文本（用于提取关键术语做精准判断）
+            quota:      至少要保证的源文件分片数量（默认 2）
 
         返回:
-            list[dict]: 可能被替换了一个元素的新 top_n 列表
+            list[dict]: 可能被替换了最多 quota 个元素的新 top_n 列表
         """
-        if not top_n:
-            return top_n
+        if not top_n or quota <= 0:
+            return top_n[:]
+
+        # quota 不能超过 top_n 长度
+        quota = min(quota, len(top_n))
 
         # 提前提取关键术语，避免在循环里重复提取
         key_terms = self._extract_key_terms(query)
 
         def _is_relevant_source(item: dict) -> bool:
             """判断是否为"含关键术语的源文件业务实现分片" """
-            # 条件1：必须是源文件（非测试文件）
             if self._compute_source_boost(item["file_path"]) <= 0:
                 return False
-            # 条件2：chunk_text 必须包含查询关键术语
             if self._compute_keyword_boost(item["chunk_text"], key_terms) <= 0:
                 return False
-            # 条件3：必须是业务实现分片（class_def 或 function）
             chunk_type = self._classify_chunk_type(item["chunk_text"])
-            if chunk_type not in ("class_def", "function"):
-                return False
-            return True
+            return chunk_type in ("class_def", "function")
 
         # ============ 第 0 步：文件名匹配优先提升 ============
-        # 针对用户明确指向某文件的查询（如"registry.py 的注册机制"）
-        # 关键术语里的纯英文单词（如 registry）若出现在源文件名里，
-        # 强制提升一个该文件的分片进 Top N，无视 chunk_type 限制
         file_name_terms = [
             t for t in key_terms
             if t.isascii() and len(t) >= 3 and "_" not in t
         ]
         if file_name_terms:
             def _file_name_matches(item: dict) -> bool:
-                """判断分片所属文件名是否包含任一查询关键术语"""
                 if self._compute_source_boost(item["file_path"]) <= 0:
                     return False
                 file_name = item["file_path"].replace("\\", "/").split("/")[-1].lower()
                 return any(term in file_name for term in file_name_terms)
 
-            # 若 top_n 里已有该文件分片，不重复提升
-            if not any(_file_name_matches(r) for r in top_n):
+            # top_n 里已有多少个匹配文件名的分片
+            existing_name_matches = sum(
+                1 for r in top_n if _file_name_matches(r)
+            )
+            if existing_name_matches < quota:
+                need = quota - existing_name_matches
+                new_items = []
                 for c in candidates:
-                    if _file_name_matches(c):
-                        new_item = dict(c)
-                        new_item["rerank_score"] = 0.0
-                        new_item["boosted_by_source_filter"] = True
-                        new_item["boost_reason"] = "file_name_match"
-                        return top_n[:-1] + [new_item]
+                    if not _file_name_matches(c):
+                        continue
+                    already = any(
+                        r["file_path"] == c["file_path"]
+                        and r["start_line"] == c["start_line"]
+                        for r in top_n + new_items
+                    )
+                    if already:
+                        continue
+                    new_item = dict(c)
+                    new_item["rerank_score"] = 0.0
+                    new_item["boosted_by_source_filter"] = True
+                    new_item["boost_reason"] = "file_name_match"
+                    new_items.append(new_item)
+                    if len(new_items) >= need:
+                        break
+                if new_items:
+                    return top_n[:-len(new_items)] + new_items
 
         # ============ 第 1 步：业务实现兜底 ============
-        # 检查 top_n 里是否已有"含关键术语的源文件分片"
-        has_relevant_source = any(_is_relevant_source(r) for r in top_n)
-        if has_relevant_source:
-            # 已有相关源文件分片，不干预 rerank 判断
+        existing_relevant = [r for r in top_n if _is_relevant_source(r)]
+        if len(existing_relevant) >= quota:
             return top_n
 
-        # 从 candidates 找分数最高的"含关键术语的源文件分片"
+        need = quota - len(existing_relevant)
+        new_items = []
+        seen_keys = {
+            (r["file_path"], r["start_line"]) for r in top_n
+        }
         for c in candidates:
             if not _is_relevant_source(c):
                 continue
-
-            # 防止重复：检查这个分片是否已经在 top_n 里
-            already_in_top = any(
-                r["file_path"] == c["file_path"]
-                and r["start_line"] == c["start_line"]
-                for r in top_n
-            )
-            if already_in_top:
+            key = (c["file_path"], c["start_line"])
+            if key in seen_keys:
                 continue
-
-            # 找到了合适的源文件分片，替换 top_n 的最后一名
+            # 文件名匹配优先：如果文件名匹配到了，同一个文件只取一个
             new_item = dict(c)
             new_item["rerank_score"] = 0.0
             new_item["boosted_by_source_filter"] = True
-            return top_n[:-1] + [new_item]
+            new_item["boost_reason"] = "business_fallback"
+            new_items.append(new_item)
+            seen_keys.add(key)
+            if len(new_items) >= need:
+                break
 
-        # candidates 里也没有符合条件的分片（极端情况），原样返回
+        if new_items:
+            return top_n[:-len(new_items)] + new_items
+
         return top_n
 
 

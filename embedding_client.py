@@ -34,8 +34,16 @@ class EmbeddingClient:
         - .env 中配置 DASHSCOPE_API_KEY 和 EMBEDDING_MODEL
     """
 
-    # qwen3.7-text-embedding 官方限制单次最多 20 条文本
-    MAX_BATCH_SIZE = 20
+    # 不同模型的单批上限不同，__init__ 时根据 EMBEDDING_MODEL 动态决定
+    #   qwen3.7-text-embedding: 20 条/批
+    #   text-embedding-v4 / v3:  10 条/批
+    #   默认兜底: 10 条
+    _MODEL_BATCH_LIMITS = {
+        "qwen3.7-text-embedding": 20,
+        "text-embedding-v4": 10,
+        "text-embedding-v3": 10,
+    }
+    _DEFAULT_BATCH_SIZE = 10
 
     def __init__(self):
         # 校验密钥与模型名
@@ -51,6 +59,11 @@ class EmbeddingClient:
         # 把 api_key 设置到 dashscope 全局
         # SDK 后续所有调用都会自动用这个 key 鉴权
         dashscope.api_key = DASHSCOPE_API_KEY
+
+        # 根据当前模型动态确定单批上限
+        self.MAX_BATCH_SIZE = self._MODEL_BATCH_LIMITS.get(
+            EMBEDDING_MODEL, self._DEFAULT_BATCH_SIZE
+        )
 
     def get_embedding(self, text: str) -> list[float]:
         """
